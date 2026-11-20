@@ -6,6 +6,12 @@
   （即使把数据改回原值也不会恢复旧结果，必须重新计算）；
 - 结果只在作业成功完成时随作业原子写入，不存在“半份结果”；
 - 进程重启后所有未完成作业标记为 interrupted，不开放任何部分结果。
+
+删组杰克刀运行（jk_runs）：
+- 依附于某个成功校准作业，与其同属一个 epoch；
+- epoch 变更时运行不删除：在途运行被标记为 invalidated（查询返回 409），
+  已完成的运行成为历史报告，同样因 epoch 失配而返回 409，绝不提供过期估计；
+- 进程重启后未完成的运行标记为 interrupted。
 """
 
 from __future__ import annotations
@@ -44,7 +50,23 @@ CREATE TABLE IF NOT EXISTS jobs (
     result TEXT,                     -- 仅终态写入（完整权重+依据，或冲突集，或错误）
     error TEXT
 );
+CREATE TABLE IF NOT EXISTS jk_runs (
+    jk_id TEXT PRIMARY KEY,
+    epoch INTEGER NOT NULL,
+    status TEXT NOT NULL,            -- queued|running|succeeded|failed|invalidated|interrupted
+    submitted_at TEXT NOT NULL,
+    finished_at TEXT,
+    source_job_id TEXT NOT NULL,     -- 源校准作业号
+    request TEXT NOT NULL,           -- 快照、权重、用电量与分组（JSON，提交时刻固化）
+    result TEXT,                     -- 仅成功终态写入（均值/各轮均值/标准误）
+    failure TEXT,                    -- 仅失败终态写入（组号+冲突目标或数值原因）
+    error TEXT
+);
 """
+
+
+class StaleEpochError(RuntimeError):
+    """写入时全局 epoch 已变化：源作业在提交瞬间失效。"""
 
 
 def _now() -> str:
@@ -72,6 +94,11 @@ class Database:
         # 重启：未完成作业一律中断，不允许读到半成品
         self._conn.execute(
             "UPDATE jobs SET status='interrupted', finished_at=?, "
+            "error='process restarted' WHERE status IN ('queued','running')",
+            (_now(),),
+        )
+        self._conn.execute(
+            "UPDATE jk_runs SET status='interrupted', finished_at=?, "
             "error='process restarted' WHERE status IN ('queued','running')",
             (_now(),),
         )
@@ -132,6 +159,14 @@ class Database:
         self._conn.execute("UPDATE meta SET epoch=? WHERE id=1", (self.epoch,))
         # 旧作业（含在途）永久失效
         self._conn.execute("DELETE FROM jobs")
+        # 在途杰克刀运行标记失效（保留行，查询返回 409）；已完成运行保留为
+        # 历史报告，但因 epoch 失配同样不再提供估计
+        self._conn.execute(
+            "UPDATE jk_runs SET status='invalidated', finished_at=?, "
+            "error='源校准作业已因输入变更而失效，剩余轮次已跳过' "
+            "WHERE status IN ('queued','running')",
+            (_now(),),
+        )
         self._cancel.set()
         # 唤醒等待者后立即重建事件，供下一轮作业使用
         self._cancel = threading.Event()
@@ -206,3 +241,72 @@ class Database:
                  error, job_id),
             )
             self._conn.commit()
+
+    # ------------------------------------------------------------------ 杰克刀
+    def create_jk_run(self, payload: dict, expected_epoch: int) -> dict:
+        """创建杰克刀运行；expected_epoch 与当前 epoch 不一致时抛 StaleEpochError。"""
+        with self._write_lock:
+            if self.epoch != expected_epoch:
+                raise StaleEpochError(
+                    f"epoch 已变为 {self.epoch}（提交时为 {expected_epoch}）"
+                )
+            jk_id = uuid.uuid4().hex
+            self._conn.execute(
+                "INSERT INTO jk_runs(jk_id, epoch, status, submitted_at, "
+                "source_job_id, request) VALUES (?,?,?,?,?,?)",
+                (jk_id, self.epoch, "queued", _now(),
+                 payload["source_job_id"],
+                 json.dumps(payload, ensure_ascii=False)),
+            )
+            self._conn.commit()
+            row = self.get_jk_run(jk_id)
+            assert row is not None
+            return row
+
+    def get_jk_run(self, jk_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM jk_runs WHERE jk_id=?", (jk_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_jk_runs(self, limit: int = 50) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT jk_id, epoch, status, source_job_id, submitted_at, "
+            "finished_at, error FROM jk_runs "
+            "ORDER BY submitted_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_jk_running(self, jk_id: str) -> None:
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE jk_runs SET status='running' "
+                "WHERE jk_id=? AND status='queued'",
+                (jk_id,),
+            )
+            self._conn.commit()
+
+    def finish_jk_run(self, jk_id: str, status: str,
+                      result: dict | None, failure: dict | None,
+                      error: str | None,
+                      only_if_epoch: int | None = None) -> bool:
+        """写入杰克刀终态。
+
+        仅在运行仍处于非终态时写入；only_if_epoch 给出时还要求全局 epoch
+        未变（成功/失败结果只在源作业仍有效时落库）。返回是否写入。
+        """
+        with self._write_lock:
+            if only_if_epoch is not None and self.epoch != only_if_epoch:
+                return False
+            cur = self._conn.execute(
+                "UPDATE jk_runs SET status=?, finished_at=?, result=?, "
+                "failure=?, error=? WHERE jk_id=? "
+                "AND status IN ('queued','running')",
+                (status, _now(),
+                 json.dumps(result, ensure_ascii=False) if result is not None else None,
+                 json.dumps(failure, ensure_ascii=False) if failure is not None else None,
+                 error, jk_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0

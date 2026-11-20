@@ -1,17 +1,26 @@
-"""FastAPI 应用：样本/目标更正、后台权重计算、结果取用。"""
+"""FastAPI 应用：样本/目标更正、后台权重计算、结果取用、删组杰克刀估计。"""
 
 from __future__ import annotations
 
 import json
+import math
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .db import Database
+from .db import Database, StaleEpochError
 from .jobs import JobManager
+from . import jackknife
 from .schemas import (
+    JackknifeFailure,
+    JackknifePayload,
+    JackknifeRecordIn,
+    JackknifeResult,
+    JackknifeRoundItem,
     JobResult,
     SamplesPayload,
     TargetsPayload,
@@ -34,11 +43,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="回访问卷样本权重校正 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "根据地区/年龄段人口总量，对至多 200 人的基础权重 d 做二次规划校正，"
         "满足 0.5d ≤ w ≤ 2d 且目标人群权重合计等于人口总量，"
         "最小化 Σ(w−d)²/d。任何样本/目标修改都会令旧结果与在途计算永久失效。"
+        "删组杰克刀接口基于成功校准作业，对家庭月用电量均值给出"
+        "全样本/各删组轮加权均值与删组杰克刀标准误。"
     ),
     lifespan=lifespan,
 )
@@ -50,6 +61,26 @@ def db() -> Database:
 
 def jobs() -> JobManager:
     return app.state.jobs
+
+
+def _sanitize_nonfinite(obj):
+    """错误详情中的 NaN/Inf 无法 JSON 序列化，替换为字符串。"""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return repr(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_nonfinite(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation(request, exc):
+    # 与默认处理器一致，仅额外清洗非有限浮点（如 kwh=NaN 的输入回显）
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(_sanitize_nonfinite(exc.errors()))},
+    )
 
 
 # ---------------------------------------------------------------- 输入更正
@@ -172,3 +203,83 @@ def get_result():
 @app.get("/health", tags=["系统"], summary="健康检查")
 def health():
     return {"status": "ok", "epoch": db().get_epoch()}
+
+
+# ---------------------------------------------------------------- 删组杰克刀
+@app.post("/jackknife", status_code=202, tags=["删组杰克刀"],
+          summary="提交删组杰克刀估计（后台执行，返回 jk_id）")
+def post_jackknife(payload: JackknifePayload):
+    job = db().get_job(payload.job_id)
+    if job is None:
+        raise HTTPException(
+            409,
+            "源校准作业不存在或已因输入变更而失效：请重新 POST /calculate "
+            "并在成功后再次提交",
+        )
+    if job["status"] != "succeeded":
+        raise HTTPException(
+            409,
+            f"源校准作业未成功（当前状态 {job['status']}），"
+            "只有成功完成的校准作业才能用于杰克刀估计",
+        )
+    records = [r.model_dump() for r in payload.records]
+    try:
+        run = jobs().submit_jackknife(job, records)
+    except jackknife.JackknifeError as exc:
+        raise HTTPException(422, str(exc))
+    except StaleEpochError:
+        raise HTTPException(
+            409, "提交瞬间输入被修改，源作业已失效：请重新计算后再次提交"
+        )
+    return JSONResponse(
+        status_code=202,
+        content={"jk_id": run["jk_id"], "epoch": run["epoch"],
+                 "status": run["status"],
+                 "source_job_id": job["job_id"],
+                 "poll": f"/jackknife/{run['jk_id']}"},
+    )
+
+
+def _serialize_jk(row: dict) -> dict:
+    req = json.loads(row["request"])
+    result = json.loads(row["result"]) if row["result"] else None
+    failure = json.loads(row["failure"]) if row["failure"] else None
+    out = JackknifeResult(
+        jk_id=row["jk_id"],
+        epoch=row["epoch"],
+        status=row["status"],
+        source_job_id=req["source_job_id"],
+        submitted_at=row["submitted_at"],
+        finished_at=row["finished_at"],
+        records=[JackknifeRecordIn(**r) for r in req["records"]],
+        group_count=len(req["labels"]),
+        group_size=len(req["samples"]) // len(req["labels"]),
+        groups=req["labels"],
+        error=row["error"],
+        mean_full=result["mean_full"] if result else None,
+        rounds=[JackknifeRoundItem(**r) for r in result["rounds"]] if result else None,
+        jk_variance=result["jk_variance"] if result else None,
+        jk_se=result["jk_se"] if result else None,
+        failure=JackknifeFailure(**failure) if failure else None,
+    )
+    return out.model_dump(exclude_none=False)
+
+
+@app.get("/jackknife/{jk_id}", tags=["删组杰克刀"],
+         summary="查询杰克刀运行状态与完整估计（源作业失效返回 409）")
+def get_jackknife(jk_id: str):
+    row = db().get_jk_run(jk_id)
+    if row is None:
+        raise HTTPException(404, "杰克刀运行不存在")
+    if row["epoch"] != db().get_epoch() or row["status"] == "invalidated":
+        raise HTTPException(
+            409,
+            "源校准作业已因输入变更而失效，本次杰克刀估计不再可取用："
+            "请重新 POST /calculate 并重新提交杰克刀请求",
+        )
+    return _serialize_jk(row)
+
+
+@app.get("/jackknife", tags=["删组杰克刀"], summary="列出最近杰克刀运行")
+def list_jackknife():
+    return {"epoch": db().get_epoch(), "runs": db().list_jk_runs()}

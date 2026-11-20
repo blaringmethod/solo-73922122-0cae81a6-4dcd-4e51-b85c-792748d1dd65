@@ -1,0 +1,12 @@
+{
+  "records": [
+    {"person_id": "P1", "kwh": 210.5, "group": 1},
+    {"person_id": "P3", "kwh": 188.0, "group": 1},
+    {"person_id": "P2", "kwh": 245.0, "group": 2},
+    {"person_id": "P4", "kwh": 176.5, "group": 2},
+    {"person_id": "P5", "kwh": 232.0, "group": 3},
+    {"person_id": "P7", "kwh": 199.5, "group": 3},
+    {"person_id": "P6", "kwh": 221.0, "group": 4},
+    {"person_id": "P8", "kwh": 167.0, "group": 4}
+  ]
+}

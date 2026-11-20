@@ -8,7 +8,8 @@
   1. 可行场景（目标行含线性冗余：四个地区之和 = 三个年龄段之和），
      轮询到成功，校验 0.5d<=w<=2d 与合计误差 <=1e-6；
   2. 冲突场景，返回最小冲突目标子集（删去任一项即可行）；
-  3. 输入修改后旧作业 404、/result 返回 409，证明旧结果永久失效。
+  3. 输入修改后旧作业 404、/result 返回 409，证明旧结果永久失效；
+  4. 删组杰克刀：家庭月用电量均值与抽样误差，以及源作业失效后的 409。
 """
 
 from __future__ import annotations
@@ -113,6 +114,52 @@ def main() -> None:
     assert status == 404
     status, _ = call("GET", "/result")
     print("GET /result ->", status, "(须重新计算)")
+    assert status == 409
+
+    print()
+    print("=" * 70)
+    print("场景 4：删组杰克刀——家庭月用电量均值与抽样误差")
+    print("=" * 70)
+    js = json.loads((HERE / "jackknife_samples.json").read_text())
+    jt = json.loads((HERE / "jackknife_targets.json").read_text())
+    jr = json.loads((HERE / "jackknife_records.json").read_text())
+    print("PUT /samples ->", call("PUT", "/samples", js)[0])
+    print("PUT /targets ->", call("PUT", "/targets", jt)[0])
+    _, ack = call("POST", "/calculate")
+    _, job = wait_job(ack["job_id"])
+    assert job["status"] == "succeeded"
+    status, ack = call("POST", "/jackknife",
+                       {"job_id": job["job_id"], "records": jr["records"]})
+    print("POST /jackknife ->", status, ack)
+    assert status == 202
+    jk_id = ack["jk_id"]
+    while True:
+        status, run = call("GET", f"/jackknife/{jk_id}")
+        assert status == 200, run
+        if run["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.2)
+    print("终态:", run["status"], "| 组数:", run["group_count"],
+          "| 每组人数:", run["group_size"])
+    assert run["status"] == "succeeded"
+    print(f"全样本加权均值 mean_full = {run['mean_full']:.6f} kWh")
+    # 独立核对：全样本均值 = Σ w·kwh / Σ w（原作业权重）
+    w = {x["person_id"]: x["w"] for x in job["weights"]}
+    kwh = {r["person_id"]: r["kwh"] for r in jr["records"]}
+    expect = sum(w[p] * kwh[p] for p in w) / sum(w.values())
+    assert abs(run["mean_full"] - expect) < 1e-9
+    for rd in run["rounds"]:
+        print(f"  第 {rd['round']} 轮（删去组 {rd['dropped_group']}，"
+              f"余 {rd['kept']} 人）: 均值 = {rd['mean']:.6f}")
+    assert len(run["rounds"]) == run["group_count"]
+    print(f"删组杰克刀标准误 jk_se = {run['jk_se']:.6f} kWh")
+    assert run["jk_se"] >= 0.0
+
+    # 源作业一旦失效，杰克刀估计不再可取用
+    call("PUT", "/targets", jt)
+    status, body = call("GET", f"/jackknife/{jk_id}")
+    print("输入更正后 GET /jackknife/{jk_id} ->", status,
+          body.get("detail", ""))
     assert status == 409
 
     print("\n全部演示断言通过 ✔")
